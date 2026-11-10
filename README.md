@@ -80,3 +80,5 @@ remove it in `v2`.
 - Third-party actions are pinned by commit SHA (tags can be rewritten), with the version in a comment.
 - Inputs reach shell steps through `env`, never inline `${{ }}` in `run` (script injection).
 - `actions/checkout` runs with `persist-credentials: false`.
+- `tf-setup` fails if any `TF_LOG*` variable is set (except `TF_LOG_PATH`): debug logs print provider
+  API responses, and job logs of a public repo are public.
