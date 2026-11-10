@@ -1,0 +1,187 @@
+name: tf-apply
+
+# Reusable: plan every stack on the merged commit, ask for approval only for stacks with changes,
+# then apply exactly the saved plan. Plans go to a private S3 bucket, never to GitHub artifacts:
+# a plan file holds values in clear text, and artifacts of a public repo are downloadable by anyone.
+# The caller must grant: contents: read, id-token: write.
+on:
+  workflow_call:
+    inputs:
+      stacks:
+        description: 'JSON array of stack directories, e.g. ["org", "identity"]'
+        type: string
+        required: true
+      plan-gha-role-arn:
+        type: string
+        required: true
+      plan-target-role-arn:
+        description: Role that may PutObject into the plan bucket
+        type: string
+        required: true
+      apply-gha-role-arn:
+        description: Hub role trusted only for the approval environment
+        type: string
+        required: true
+      apply-target-role-arn:
+        description: Role that may GetObject from the plan bucket
+        type: string
+        required: true
+      target-account-id:
+        type: string
+        required: true
+      plan-bucket:
+        type: string
+        required: true
+      plan-prefix:
+        description: Key prefix the plan / apply roles are allowed to use
+        type: string
+        required: true
+      environment:
+        description: GitHub environment with required reviewers
+        type: string
+        default: prod
+      aws-region:
+        type: string
+        default: eu-central-1
+      backend-config:
+        type: string
+        default: backend.hcl
+
+jobs:
+  plan:
+    name: plan (${{ matrix.stack }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      id-token: write
+    strategy:
+      fail-fast: false
+      matrix:
+        stack: ${{ fromJSON(inputs.stacks) }}
+    defaults:
+      run:
+        shell: bash
+        working-directory: ${{ matrix.stack }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: prohres/ci-templates/actions/tf-setup@v1
+        with:
+          working-directory: ${{ matrix.stack }}
+          gha-role-arn: ${{ inputs.plan-gha-role-arn }}
+          target-role-arn: ${{ inputs.plan-target-role-arn }}
+          target-account-id: ${{ inputs.target-account-id }}
+          aws-region: ${{ inputs.aws-region }}
+          backend-config: ${{ inputs.backend-config }}
+
+      - name: terraform plan
+        id: plan
+        run: |
+          set +e
+          terraform plan -input=false -no-color -lock-timeout=5m -detailed-exitcode -out=tfplan | tee plan.txt
+          rc=${PIPESTATUS[0]}
+          set -e
+          # -detailed-exitcode: 0 = no changes, 2 = changes, 1 = error
+          case "$rc" in
+            0) changes=false ;;
+            2) changes=true ;;
+            *) exit "$rc" ;;
+          esac
+          echo "$changes" > "${RUNNER_TEMP}/${STACK}.changes"
+          echo "changes=${changes}" >> "$GITHUB_OUTPUT"
+          {
+            echo "### plan: \`${STACK}\` (changes: ${changes})"
+            echo '```'
+            tail -c 60000 plan.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY" # what the reviewer reads before approving
+        env:
+          STACK: ${{ matrix.stack }}
+
+      - name: Save plan to S3
+        if: steps.plan.outputs.changes == 'true'
+        env:
+          URI: s3://${{ inputs.plan-bucket }}/${{ inputs.plan-prefix }}/${{ github.run_id }}/${{ matrix.stack }}.tfplan
+        run: aws s3 cp tfplan "$URI" --only-show-errors
+
+      # Only "true"/"false" per stack goes to GitHub artifacts: nothing sensitive
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: changes-${{ matrix.stack }}
+          path: ${{ runner.temp }}/${{ matrix.stack }}.changes
+          retention-days: 1
+
+  changes:
+    name: stacks with changes
+    needs: plan
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions: {}
+    outputs:
+      stacks: ${{ steps.list.outputs.stacks }}
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: changes-*
+          path: changes
+          merge-multiple: true
+
+      - name: Build the apply matrix
+        id: list
+        shell: bash
+        run: |
+          # grep exits 1 when no stack has changes; with pipefail that must not fail the step
+          stacks=$( { grep -lx true changes/*.changes || true; } | xargs -r -n1 basename | sed 's/\.changes$//' \
+            | jq -R -s -c 'split("\n") | map(select(length > 0))')
+          echo "stacks=${stacks}" >> "$GITHUB_OUTPUT"
+          echo "Stacks to apply: ${stacks}" >> "$GITHUB_STEP_SUMMARY"
+
+  apply:
+    name: apply (${{ matrix.stack }})
+    needs: changes
+    if: needs.changes.outputs.stacks != '[]' # no changes, no approval request
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    environment: ${{ inputs.environment }} # pauses here until a reviewer approves
+    concurrency:
+      group: tf-apply-${{ github.repository }}-${{ matrix.stack }}
+      cancel-in-progress: false # an interrupted apply leaves the state half-changed
+    permissions:
+      contents: read
+      id-token: write
+    strategy:
+      fail-fast: false
+      matrix:
+        stack: ${{ fromJSON(needs.changes.outputs.stacks) }}
+    defaults:
+      run:
+        shell: bash
+        working-directory: ${{ matrix.stack }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: prohres/ci-templates/actions/tf-setup@v1
+        with:
+          working-directory: ${{ matrix.stack }}
+          gha-role-arn: ${{ inputs.apply-gha-role-arn }}
+          target-role-arn: ${{ inputs.apply-target-role-arn }}
+          target-account-id: ${{ inputs.target-account-id }}
+          aws-region: ${{ inputs.aws-region }}
+          backend-config: ${{ inputs.backend-config }}
+
+      - name: Fetch the approved plan
+        env:
+          URI: s3://${{ inputs.plan-bucket }}/${{ inputs.plan-prefix }}/${{ github.run_id }}/${{ matrix.stack }}.tfplan
+        run: aws s3 cp "$URI" tfplan --only-show-errors
+
+      # A stale plan (state changed since planning) is refused by Terraform itself
+      - name: terraform apply
+        run: terraform apply -input=false -no-color tfplan
+
+      - name: Follow-up plan must show no changes
+        run: terraform plan -input=false -no-color -lock-timeout=5m -detailed-exitcode

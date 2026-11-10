@@ -9,6 +9,7 @@ how CI works instead of a copy in every repo.
 |---|---|---|
 | `actions/tf-setup` | composite action | Terraform from `.terraform-version` (no wrapper) → OIDC hub role → role chaining into the target role → `terraform init` with a shared `backend.hcl` |
 | `.github/workflows/tf-plan.yml` | reusable workflow | matrix per stack: `fmt -check` → `validate` → `plan`; plan posted as one PR comment per stack, updated in place |
+| `.github/workflows/tf-apply.yml` | reusable workflow | after merge: plan per stack (saved to a private S3 bucket) → approval in a GitHub environment, only for stacks with changes → apply exactly the saved plan → follow-up plan must be clean |
 
 Composite actions are building blocks (steps on the caller's runner); reusable workflows are whole
 pipelines (own jobs, matrix, permissions, environments).
@@ -31,6 +32,36 @@ jobs:
 ```
 
 A reusable workflow never gets more permissions than its caller grants.
+
+Apply after merge:
+
+```yaml
+on:
+  push:
+    branches: [develop]
+concurrency:
+  group: terraform-apply
+  cancel-in-progress: false  # never interrupt an apply
+jobs:
+  apply:
+    permissions:
+      contents: read
+      id-token: write
+    uses: prohres/ci-templates/.github/workflows/tf-apply.yml@v1
+    with:
+      stacks: '["org", "identity"]'
+      plan-gha-role-arn: arn:aws:iam::<hub-account>:role/gha-plan
+      plan-target-role-arn: arn:aws:iam::<target-account>:role/org-tf-plan
+      apply-gha-role-arn: arn:aws:iam::<hub-account>:role/gha-apply
+      apply-target-role-arn: arn:aws:iam::<target-account>:role/org-tf-apply
+      target-account-id: "<target-account>"
+      plan-bucket: <private-bucket>
+      plan-prefix: <repo-name>
+```
+
+Saved plans hold values in clear text, so they go to a private S3 bucket, never to GitHub artifacts
+(artifacts of a public repo are downloadable by anyone). Only a `true` / `false` "has changes" flag per
+stack travels as an artifact.
 
 ## Versioning
 
