@@ -52,6 +52,16 @@ runs:
         terraform_version: ${{ steps.version.outputs.terraform }}
         terraform_wrapper: false # the wrapper rewrites stdout and exit codes (breaks -detailed-exitcode)
 
+    # Last line of defence for a public repo: a provider error can print a sensitive value in clear text
+    # (e.g. an over-long account email). Every later `terraform` call in the job goes through an email mask.
+    - name: Mask emails in Terraform output
+      shell: bash
+      env:
+        MASK_DIR: ${{ github.action_path }}/mask
+      run: |
+        echo "TF_REAL=$(command -v terraform)" >> "$GITHUB_ENV"
+        echo "$MASK_DIR" >> "$GITHUB_PATH"
+
     - name: Assume hub role (OIDC)
       uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
       with:
