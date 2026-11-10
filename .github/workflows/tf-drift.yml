@@ -1,0 +1,123 @@
+name: tf-drift
+
+# Reusable: scheduled plan per stack; drift (exit code 2) opens or updates one issue per stack,
+# a clean plan closes it. No auto-apply: drift may be deliberate (a hotfix), a human decides.
+# The caller must grant: contents: read, id-token: write, issues: write.
+on:
+  workflow_call:
+    inputs:
+      stacks:
+        description: 'JSON array of stack directories, e.g. ["org", "identity"]'
+        type: string
+        required: true
+      gha-role-arn:
+        type: string
+        required: true
+      target-role-arn:
+        type: string
+        required: true
+      target-account-id:
+        type: string
+        required: true
+      aws-region:
+        type: string
+        default: eu-central-1
+      backend-config:
+        type: string
+        default: backend.hcl
+      issue-label:
+        type: string
+        default: drift
+
+jobs:
+  drift:
+    name: drift
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      id-token: write
+      issues: write
+    strategy:
+      fail-fast: false
+      matrix:
+        stack: ${{ fromJSON(inputs.stacks) }}
+    defaults:
+      run:
+        shell: bash
+        working-directory: ${{ matrix.stack }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: prohres/ci-templates/actions/tf-setup@v1
+        with:
+          working-directory: ${{ matrix.stack }}
+          gha-role-arn: ${{ inputs.gha-role-arn }}
+          target-role-arn: ${{ inputs.target-role-arn }}
+          target-account-id: ${{ inputs.target-account-id }}
+          aws-region: ${{ inputs.aws-region }}
+          backend-config: ${{ inputs.backend-config }}
+
+      # A full plan, not -refresh-only: catches manual changes and merged-but-unapplied code.
+      # The state lock (with a timeout) makes a check during an apply wait instead of reporting half-applied state.
+      - name: terraform plan
+        id: plan
+        env:
+          STACK: ${{ matrix.stack }}
+        run: |
+          set +e
+          terraform plan -input=false -no-color -lock-timeout=5m -detailed-exitcode | tee plan.txt
+          rc=${PIPESTATUS[0]}
+          set -e
+          # -detailed-exitcode: 0 = no changes, 2 = changes, 1 = error (fails the job → GitHub notification)
+          case "$rc" in
+            0) drift=false ;;
+            2) drift=true ;;
+            *) exit "$rc" ;;
+          esac
+          echo "drift=${drift}" >> "$GITHUB_OUTPUT"
+          {
+            echo "### drift check: \`${STACK}\` (drift: ${drift})"
+            echo '```'
+            tail -c 60000 plan.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # The issue gets resource addresses and the Plan: line only; the full plan stays in the job summary
+      - name: Open, update or close the drift issue
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          STACK: ${{ matrix.stack }}
+          DRIFT: ${{ steps.plan.outputs.drift }}
+          LABEL: ${{ inputs.issue-label }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          export TITLE="Drift detected: ${STACK}"
+          number=$(gh issue list --label "$LABEL" --state open --limit 100 --json number,title \
+            -q '.[] | select(.title == env.TITLE) | .number' | head -n 1)
+          if [ "$DRIFT" = true ]; then
+            {
+              echo "Scheduled \`terraform plan\` of \`${STACK}\` differs from the state:"
+              echo "a manual change in AWS, or code merged but not applied."
+              echo
+              grep -E '^Plan:' plan.txt || true
+              echo
+              echo 'Resources:'
+              grep -E '^  # .+ (will be|must be|has changed|has been deleted)' plan.txt \
+                | sed -E 's/^  # (.*)$/- `\1`/' || true
+              echo
+              echo 'Fix: apply the code to revert the manual change, or change the code to keep it.'
+              echo "Full plan and last check: ${RUN_URL}"
+            } > body.md
+            if [ -n "$number" ]; then
+              gh issue edit "$number" --body-file body.md
+            else
+              gh label create "$LABEL" --color D93F0B --description "Found by scheduled terraform plan" --force
+              gh issue create --title "$TITLE" --label "$LABEL" --body-file body.md
+            fi
+          elif [ -n "$number" ]; then
+            gh issue close "$number" --comment "No drift as of ${RUN_URL}"
+          fi

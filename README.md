@@ -10,6 +10,7 @@ how CI works instead of a copy in every repo.
 | `actions/tf-setup` | composite action | Terraform from `.terraform-version` (no wrapper) → OIDC hub role → role chaining into the target role → `terraform init` with a shared `backend.hcl` |
 | `.github/workflows/tf-plan.yml` | reusable workflow | `lint` job without cloud access (tflint + checkov, configured by the caller's `.tflint.hcl` / `.checkov.yaml`) → matrix per stack: `fmt -check` → `validate` → `plan`; plan posted as one PR comment per stack, updated in place |
 | `.github/workflows/tf-apply.yml` | reusable workflow | after merge: plan per stack (saved to a private S3 bucket) → approval in a GitHub environment, only for stacks with changes → apply exactly the saved plan → follow-up plan must be clean |
+| `.github/workflows/tf-drift.yml` | reusable workflow | scheduled plan per stack: drift opens or updates one issue per stack (resource addresses only), a clean plan closes it; no auto-apply |
 
 Composite actions are building blocks (steps on the caller's runner); reusable workflows are whole
 pipelines (own jobs, matrix, permissions, environments).
@@ -62,6 +63,28 @@ jobs:
 Saved plans hold values in clear text, so they go to a private S3 bucket, never to GitHub artifacts
 (artifacts of a public repo are downloadable by anyone). Only a `true` / `false` "has changes" flag per
 stack travels as an artifact.
+
+Drift detection (schedule runs on the default branch only; GitHub disables schedules in public
+repos after 60 days without activity):
+
+```yaml
+on:
+  schedule:
+    - cron: "0 6 * * *"
+  workflow_dispatch:
+jobs:
+  drift:
+    permissions:
+      contents: read
+      id-token: write
+      issues: write
+    uses: prohres/ci-templates/.github/workflows/tf-drift.yml@v1
+    with:
+      stacks: '["org", "identity"]'
+      gha-role-arn: arn:aws:iam::<hub-account>:role/gha-plan
+      target-role-arn: arn:aws:iam::<target-account>:role/org-tf-plan
+      target-account-id: "<target-account>"
+```
 
 ## Versioning
 
