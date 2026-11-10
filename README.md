@@ -8,7 +8,7 @@ how CI works instead of a copy in every repo.
 | Path | Kind | What it does |
 |---|---|---|
 | `actions/tf-setup` | composite action | Terraform from `.terraform-version` (no wrapper) → OIDC hub role → role chaining into the target role → `terraform init` with a shared `backend.hcl` |
-| `.github/workflows/tf-plan.yml` | reusable workflow | `lint` job without cloud access (tflint + checkov, configured by the caller's `.tflint.hcl` / `.checkov.yaml`) → matrix per stack: `fmt -check` → `validate` → `plan`; plan posted as one PR comment per stack, updated in place |
+| `.github/workflows/tf-plan.yml` | reusable workflow | `lint` job without cloud access (tflint + checkov, configured by the caller's `.tflint.hcl` / `.checkov.yaml`) → optional selection of changed stacks → matrix per stack: `fmt -check` → `validate` → `plan`; plan posted as one PR comment per stack, updated in place; `terraform-ok` aggregates the result |
 | `.github/workflows/tf-apply.yml` | reusable workflow | after merge: plan per stack (saved to a private S3 bucket) → approval in a GitHub environment, only for stacks with changes → apply exactly the saved plan → follow-up plan must be clean |
 | `.github/workflows/tf-drift.yml` | reusable workflow | scheduled plan per stack: drift opens or updates one issue per stack (resource addresses only), a clean plan closes it; no auto-apply |
 
@@ -33,6 +33,17 @@ jobs:
 ```
 
 A reusable workflow never gets more permissions than its caller grants.
+
+Plan only the stacks a PR changed (`<stack>/` plus extra prefixes; a change under `global-paths`
+plans every stack). Mark `plan / terraform-ok` as the only required check: it always reports,
+while a skipped workflow (`on.pull_request.paths`) or a skipped job would leave a required check waiting forever.
+
+```yaml
+    with:
+      stacks: '["org", "identity"]'
+      changed-only: true
+      stack-paths: '{"org": ["policies/"]}'
+```
 
 Apply after merge:
 

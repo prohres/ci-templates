@@ -1,7 +1,8 @@
 name: tf-plan
 
-# Reusable: static checks (tflint + checkov) once per repo, then fmt / validate / plan per stack,
-# plan posted as a PR comment (one per stack, updated in place).
+# Reusable: static checks (tflint + checkov) once per repo, then fmt / validate / plan per stack
+# (optionally only the stacks a PR changed), plan posted as a PR comment (one per stack, updated in place).
+# Mark "<caller job> / terraform-ok" as the required check: it reports on every PR, even when no stack is planned.
 # The caller must grant: contents: read, id-token: write, pull-requests: write.
 on:
   workflow_call:
@@ -31,6 +32,18 @@ on:
       checkov-version:
         type: string
         default: 3.3.30
+      changed-only:
+        description: On pull_request, plan only the stacks whose paths changed (lint always runs)
+        type: boolean
+        default: false
+      stack-paths:
+        description: 'JSON object of extra path prefixes per stack, e.g. {"org": ["policies/"]}; <stack>/ is always included'
+        type: string
+        default: '{}'
+      global-paths:
+        description: JSON array of path prefixes that make every stack plan
+        type: string
+        default: '["backend.hcl", ".terraform-version", ".github/"]'
 
 jobs:
   # No id-token here: third-party linters and their dependencies never see AWS credentials
@@ -80,9 +93,52 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
           exit "$rc"
 
+  changes:
+    name: changed stacks
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    outputs:
+      stacks: ${{ steps.list.outputs.stacks }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        if: inputs.changed-only && github.event_name == 'pull_request'
+        with:
+          persist-credentials: false
+          fetch-depth: 0 # the diff needs the base commit
+
+      # Prefix match in jq instead of a third-party changed-files action (tj-actions/changed-files, 2025)
+      - name: Select stacks
+        id: list
+        shell: bash
+        env:
+          CHANGED_ONLY: ${{ inputs.changed-only && github.event_name == 'pull_request' }}
+          STACKS: ${{ inputs.stacks }}
+          STACK_PATHS: ${{ inputs.stack-paths }}
+          GLOBAL_PATHS: ${{ inputs.global-paths }}
+          BASE: ${{ github.event.pull_request.base.sha }}
+          HEAD: ${{ github.event.pull_request.head.sha }}
+        run: |
+          if [ "$CHANGED_ONLY" != true ]; then
+            stacks=$(jq -c . <<< "$STACKS")
+          else
+            # Three dots: what the PR branch changed since it forked, not newer commits on the base
+            stacks=$(git diff --name-only "${BASE}...${HEAD}" | jq -R -s -c \
+              --argjson all "$STACKS" --argjson extra "$STACK_PATHS" --argjson global "$GLOBAL_PATHS" '
+              split("\n") | map(select(length > 0)) as $files
+              | def touched($prefixes): any($files[]; . as $f | any($prefixes[]; . as $p | $f | startswith($p)));
+                if touched($global) then $all
+                else [$all[] | select(. as $s | touched([$s + "/"] + ($extra[$s] // [])))]
+                end')
+          fi
+          echo "stacks=${stacks}" >> "$GITHUB_OUTPUT"
+          echo "Stacks to plan: ${stacks}" >> "$GITHUB_STEP_SUMMARY"
+
   plan:
     name: plan # GitHub appends the matrix value; a skipped job has no matrix to show
-    needs: lint # cheap checks first: broken code never takes the state lock
+    needs: [lint, changes] # cheap checks first: broken code never takes the state lock
+    if: needs.changes.outputs.stacks != '[]'
     runs-on: ubuntu-latest
     timeout-minutes: 20 # the default is 6 h; a stuck plan must not hold the state lock that long
     permissions:
@@ -92,7 +148,7 @@ jobs:
     strategy:
       fail-fast: false # one broken stack must not hide the plans of the others
       matrix:
-        stack: ${{ fromJSON(inputs.stacks) }}
+        stack: ${{ fromJSON(needs.changes.outputs.stacks) }}
     defaults:
       run:
         shell: bash # explicit shell adds -o pipefail: a failed plan piped into tee must fail the step
@@ -151,3 +207,24 @@ jobs:
           else
             gh pr comment "$PR" -R "$REPO" --body-file comment.md
           fi
+
+  # The one job to mark as required: it always runs, so a PR that plans no stack still reports
+  # a result instead of leaving the required check "Expected — waiting" forever
+  result:
+    name: terraform-ok
+    needs: [lint, changes, plan]
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions: {}
+    steps:
+      - name: All required jobs passed
+        shell: bash
+        env:
+          LINT: ${{ needs.lint.result }}
+          CHANGES: ${{ needs.changes.result }}
+          PLAN: ${{ needs.plan.result }}
+        run: |
+          echo "lint=${LINT} changes=${CHANGES} plan=${PLAN}"
+          # plan is skipped when no stack changed; a plan skipped after a failed lint is caught by LINT
+          [ "$LINT" = success ] && [ "$CHANGES" = success ] && [[ "$PLAN" =~ ^(success|skipped)$ ]]
