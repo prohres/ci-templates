@@ -140,7 +140,7 @@ jobs:
           echo "Stacks to apply: ${stacks}" >> "$GITHUB_STEP_SUMMARY"
 
   apply:
-    name: apply (${{ matrix.stack }})
+    name: apply # GitHub appends the matrix value; a skipped job has no matrix to show
     needs: changes
     if: needs.changes.outputs.stacks != '[]' # no changes, no approval request
     runs-on: ubuntu-latest

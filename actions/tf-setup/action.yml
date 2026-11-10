@@ -29,6 +29,17 @@ inputs:
 runs:
   using: composite
   steps:
+    # Debug logs print provider API responses (e.g. account emails from Organizations)
+    # into the job log, and logs of a public repo are readable by anyone
+    - name: Refuse Terraform debug logging
+      shell: bash
+      run: |
+        vars=$(compgen -e | grep -E '^TF_LOG' | grep -vx TF_LOG_PATH || true)
+        if [ -n "$vars" ]; then
+          echo "::error::Terraform debug logging is not allowed in CI (logs are public): ${vars//$'\n'/, }"
+          exit 1
+        fi
+
     - name: Read Terraform version
       id: version
       shell: bash
