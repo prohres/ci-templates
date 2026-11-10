@@ -1,0 +1,98 @@
+name: tf-plan
+
+# Reusable: fmt / validate / plan per stack, plan posted as a PR comment (one per stack, updated in place).
+# The caller must grant: contents: read, id-token: write, pull-requests: write.
+on:
+  workflow_call:
+    inputs:
+      stacks:
+        description: 'JSON array of stack directories, e.g. ["org", "identity"]'
+        type: string
+        required: true
+      gha-role-arn:
+        type: string
+        required: true
+      target-role-arn:
+        type: string
+        required: true
+      target-account-id:
+        type: string
+        required: true
+      aws-region:
+        type: string
+        default: eu-central-1
+      backend-config:
+        type: string
+        default: backend.hcl
+
+jobs:
+  plan:
+    name: plan (${{ matrix.stack }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 20 # the default is 6 h; a stuck plan must not hold the state lock that long
+    permissions:
+      contents: read
+      id-token: write
+      pull-requests: write
+    strategy:
+      fail-fast: false # one broken stack must not hide the plans of the others
+      matrix:
+        stack: ${{ fromJSON(inputs.stacks) }}
+    defaults:
+      run:
+        shell: bash # explicit shell adds -o pipefail: a failed plan piped into tee must fail the step
+        working-directory: ${{ matrix.stack }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # Full reference on purpose: ./ would resolve against the caller's checkout, not this repo
+      - uses: prohres/ci-templates/actions/tf-setup@v1
+        with:
+          working-directory: ${{ matrix.stack }}
+          gha-role-arn: ${{ inputs.gha-role-arn }}
+          target-role-arn: ${{ inputs.target-role-arn }}
+          target-account-id: ${{ inputs.target-account-id }}
+          aws-region: ${{ inputs.aws-region }}
+          backend-config: ${{ inputs.backend-config }}
+
+      - name: terraform fmt
+        run: terraform fmt -check -recursive
+
+      - name: terraform validate
+        run: terraform validate -no-color
+
+      - name: terraform plan
+        run: terraform plan -input=false -no-color -lock-timeout=5m -out=tfplan | tee plan.txt
+
+      - name: Post plan to the PR
+        if: github.event_name == 'pull_request'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PR: ${{ github.event.pull_request.number }}
+          STACK: ${{ matrix.stack }}
+        run: |
+          marker="<!-- tf-plan:${STACK} -->"
+          {
+            echo "$marker"
+            echo "### terraform plan: \`${STACK}\`"
+            grep -E '^(Plan:|No changes\.)' plan.txt || echo 'see job log'
+            echo
+            echo '<details><summary>Full plan</summary>'
+            echo
+            echo '```'
+            tail -c 60000 plan.txt # PR comments are capped at 65536 characters
+            echo '```'
+            echo '</details>'
+          } > comment.md
+          cat comment.md >> "$GITHUB_STEP_SUMMARY"
+
+          existing=$(gh api "repos/${REPO}/issues/${PR}/comments" --paginate \
+            -q ".[] | select(.body | startswith(\"${marker}\")) | .id" | head -n 1)
+          if [ -n "$existing" ]; then
+            gh api -X PATCH "repos/${REPO}/issues/comments/${existing}" -F body=@comment.md > /dev/null
+          else
+            gh pr comment "$PR" -R "$REPO" --body-file comment.md
+          fi
