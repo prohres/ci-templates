@@ -1,6 +1,7 @@
 name: tf-plan
 
-# Reusable: fmt / validate / plan per stack, plan posted as a PR comment (one per stack, updated in place).
+# Reusable: static checks (tflint + checkov) once per repo, then fmt / validate / plan per stack,
+# plan posted as a PR comment (one per stack, updated in place).
 # The caller must grant: contents: read, id-token: write, pull-requests: write.
 on:
   workflow_call:
@@ -24,10 +25,64 @@ on:
       backend-config:
         type: string
         default: backend.hcl
+      tflint-version:
+        type: string
+        default: v0.65.0
+      checkov-version:
+        type: string
+        default: 3.3.30
 
 jobs:
+  # No id-token here: third-party linters and their dependencies never see AWS credentials
+  lint:
+    name: lint (tflint + checkov)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: terraform-linters/setup-tflint@6ffdbaa3be476b3431f7275c26966ef32ff60337 # v6.3.2
+        with:
+          tflint_version: ${{ inputs.tflint-version }}
+
+      - name: tflint
+        env:
+          GITHUB_TOKEN: ${{ github.token }} # plugin downloads hit the API rate limit without it
+        run: |
+          # --recursive resolves a relative --config per directory, so pass an absolute path
+          config=()
+          [ -f .tflint.hcl ] && config=(--config "$GITHUB_WORKSPACE/.tflint.hcl")
+          tflint --init "${config[@]}"
+          tflint --recursive --format compact "${config[@]}"
+
+      # Reads .checkov.yaml from the repo root if present; --compact keeps code out of the log
+      - name: checkov
+        env:
+          CHECKOV_VERSION: ${{ inputs.checkov-version }}
+        run: |
+          pipx install --quiet "checkov==${CHECKOV_VERSION}"
+          set +e
+          checkov --directory . --framework terraform --compact --quiet | tee checkov.txt
+          rc=${PIPESTATUS[0]}
+          set -e
+          {
+            echo '### checkov'
+            echo '```'
+            tail -c 60000 checkov.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          exit "$rc"
+
   plan:
-    name: plan (${{ matrix.stack }})
+    name: plan # GitHub appends the matrix value; a skipped job has no matrix to show
+    needs: lint # cheap checks first: broken code never takes the state lock
     runs-on: ubuntu-latest
     timeout-minutes: 20 # the default is 6 h; a stuck plan must not hold the state lock that long
     permissions:
