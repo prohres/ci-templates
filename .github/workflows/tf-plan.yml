@@ -159,7 +159,7 @@ jobs:
           persist-credentials: false
 
       # Full reference on purpose: ./ would resolve against the caller's checkout, not this repo
-      - uses: prohres/ci-templates/actions/tf-setup@v1
+      - uses: prohres/ci-templates/actions/tf-setup@feat/tf-output-mask # TEMP canary, revert before merge
         with:
           working-directory: ${{ matrix.stack }}
           gha-role-arn: ${{ inputs.gha-role-arn }}
