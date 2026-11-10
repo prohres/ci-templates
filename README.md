@@ -7,7 +7,7 @@ how CI works instead of a copy in every repo.
 
 | Path | Kind | What it does |
 |---|---|---|
-| `actions/tf-setup` | composite action | Terraform from `.terraform-version` (no wrapper) → OIDC hub role → role chaining into the target role → `terraform init` with a shared `backend.hcl` |
+| `actions/tf-setup` | composite action | Terraform from `.terraform-version` (no wrapper) → email mask on `PATH` → OIDC hub role → role chaining into the target role → `terraform init` with a shared `backend.hcl` |
 | `.github/workflows/tf-plan.yml` | reusable workflow | `lint` job without cloud access (tflint + checkov, configured by the caller's `.tflint.hcl` / `.checkov.yaml`) → optional selection of changed stacks → matrix per stack: `fmt -check` → `validate` → `plan`; plan posted as one PR comment per stack, updated in place; `terraform-ok` aggregates the result |
 | `.github/workflows/tf-apply.yml` | reusable workflow | after merge: plan per stack (saved to a private S3 bucket) → approval in a GitHub environment, only for stacks with changes → apply exactly the saved plan → follow-up plan must be clean |
 | `.github/workflows/tf-drift.yml` | reusable workflow | scheduled plan per stack: drift opens or updates one issue per stack (resource addresses only), a clean plan closes it; no auto-apply |
@@ -115,5 +115,8 @@ remove it in `v2`.
 - Inputs reach shell steps through `env`, never inline `${{ }}` in `run` (script injection).
 - `actions/checkout` runs with `persist-credentials: false`.
 - Static checks run in a job without `id-token`; tool versions are pinned and at least two weeks old.
+- `tf-setup` puts an email mask in front of `terraform` on `PATH`: every later Terraform call in the job
+  prints `[redacted-email]` instead of an address (a provider error can print a sensitive value in clear
+  text). Exit codes are kept; stderr is merged into stdout.
 - `tf-setup` fails if any `TF_LOG*` variable is set (except `TF_LOG_PATH`): debug logs print provider
   API responses, and job logs of a public repo are public.

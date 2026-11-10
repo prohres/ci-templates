@@ -1,0 +1,6 @@
+#!/usr/bin/env bash
+# Put in front of the real terraform on PATH by tf-setup: Terraform output in a public repo's log must
+# never show an email, even one a provider prints in clear text. Exit codes (-detailed-exitcode) are kept.
+set -o pipefail
+"${TF_REAL:?}" "$@" 2>&1 | sed -u -E 's/[[:alnum:]._%+-]+@[[:alnum:].-]+\.[[:alpha:]]{2,}/[redacted-email]/g'
+exit "${PIPESTATUS[0]}"
