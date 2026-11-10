@@ -81,7 +81,7 @@ jobs:
           exit "$rc"
 
   plan:
-    name: plan (${{ matrix.stack }})
+    name: plan # GitHub appends the matrix value; a skipped job has no matrix to show
     needs: lint # cheap checks first: broken code never takes the state lock
     runs-on: ubuntu-latest
     timeout-minutes: 20 # the default is 6 h; a stuck plan must not hold the state lock that long
