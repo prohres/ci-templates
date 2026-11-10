@@ -8,7 +8,7 @@ how CI works instead of a copy in every repo.
 | Path | Kind | What it does |
 |---|---|---|
 | `actions/tf-setup` | composite action | Terraform from `.terraform-version` (no wrapper) → OIDC hub role → role chaining into the target role → `terraform init` with a shared `backend.hcl` |
-| `.github/workflows/tf-plan.yml` | reusable workflow | matrix per stack: `fmt -check` → `validate` → `plan`; plan posted as one PR comment per stack, updated in place |
+| `.github/workflows/tf-plan.yml` | reusable workflow | `lint` job without cloud access (tflint + checkov, configured by the caller's `.tflint.hcl` / `.checkov.yaml`) → matrix per stack: `fmt -check` → `validate` → `plan`; plan posted as one PR comment per stack, updated in place |
 | `.github/workflows/tf-apply.yml` | reusable workflow | after merge: plan per stack (saved to a private S3 bucket) → approval in a GitHub environment, only for stacks with changes → apply exactly the saved plan → follow-up plan must be clean |
 
 Composite actions are building blocks (steps on the caller's runner); reusable workflows are whole
@@ -80,5 +80,6 @@ remove it in `v2`.
 - Third-party actions are pinned by commit SHA (tags can be rewritten), with the version in a comment.
 - Inputs reach shell steps through `env`, never inline `${{ }}` in `run` (script injection).
 - `actions/checkout` runs with `persist-credentials: false`.
+- Static checks run in a job without `id-token`; tool versions are pinned and at least two weeks old.
 - `tf-setup` fails if any `TF_LOG*` variable is set (except `TF_LOG_PATH`): debug logs print provider
   API responses, and job logs of a public repo are public.
