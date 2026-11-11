@@ -22,6 +22,11 @@ inputs:
   backend-config:
     description: Partial backend config, relative to the repo root
     default: backend.hcl
+  backend-bucket:
+    description: >-
+      State bucket, passed to init on top of backend-config; lets a public repo keep the bucket
+      name (often derived from an account id) out of git. Empty: the bucket comes from backend-config.
+    default: ''
   version-file:
     description: File with the Terraform version, relative to the repo root
     default: .terraform-version
@@ -78,9 +83,21 @@ runs:
         aws-region: ${{ inputs.aws-region }}
         allowed-account-ids: ${{ inputs.target-account-id }}
 
+    # Stacks that declare variable "account_id" get the guardrail value without a committed tfvars
+    # (undeclared TF_VAR_* are ignored, so other stacks are unaffected)
+    - name: Export the target account id to Terraform
+      shell: bash
+      env:
+        ACCOUNT_ID: ${{ inputs.target-account-id }}
+      run: echo "TF_VAR_account_id=$ACCOUNT_ID" >> "$GITHUB_ENV"
+
     - name: terraform init
       shell: bash
       working-directory: ${{ inputs.working-directory }}
       env:
         BACKEND_CONFIG: ${{ github.workspace }}/${{ inputs.backend-config }}
-      run: terraform init -input=false -backend-config="$BACKEND_CONFIG"
+        BACKEND_BUCKET: ${{ inputs.backend-bucket }}
+      run: |
+        args=(-input=false -backend-config="$BACKEND_CONFIG")
+        if [[ -n "$BACKEND_BUCKET" ]]; then args+=(-backend-config="bucket=$BACKEND_BUCKET"); fi
+        terraform init "${args[@]}"

@@ -46,6 +46,10 @@ on:
       backend-config:
         type: string
         default: backend.hcl
+      backend-bucket:
+        description: State bucket on top of backend-config (empty = from backend-config)
+        type: string
+        default: ''
 
 jobs:
   plan:
@@ -76,6 +80,7 @@ jobs:
           target-account-id: ${{ inputs.target-account-id }}
           aws-region: ${{ inputs.aws-region }}
           backend-config: ${{ inputs.backend-config }}
+          backend-bucket: ${{ inputs.backend-bucket }}
 
       - name: terraform plan
         id: plan
@@ -173,6 +178,7 @@ jobs:
           target-account-id: ${{ inputs.target-account-id }}
           aws-region: ${{ inputs.aws-region }}
           backend-config: ${{ inputs.backend-config }}
+          backend-bucket: ${{ inputs.backend-bucket }}
 
       - name: Fetch the approved plan
         env:
