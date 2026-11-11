@@ -1,0 +1,139 @@
+name: deploy-ecs
+
+# Reusable: roll out an image digest to one ECS service. Registers a new revision of the current task
+# definition with only the image changed (Terraform owns everything else), waits for the rollout and
+# fails if ECS rolled it back (circuit breaker), then smoke-tests the URL.
+# Rollback = run this again with an earlier digest. The caller must grant: id-token: write.
+on:
+  workflow_call:
+    inputs:
+      environment:
+        description: GitHub environment (its OIDC sub selects the hub role)
+        type: string
+        required: true
+      image-ref:
+        description: <registry>/<name>@sha256:... from container-build
+        type: string
+        required: true
+      gha-role-arn:
+        description: Hub role trusted only for this environment
+        type: string
+        required: true
+      target-role-arn:
+        description: Deploy role in the workload account
+        type: string
+        required: true
+      target-account-id:
+        type: string
+        required: true
+      cluster:
+        type: string
+        required: true
+      service:
+        type: string
+        required: true
+      task-family:
+        type: string
+        required: true
+      container-name:
+        type: string
+        required: true
+      aws-region:
+        type: string
+        default: eu-central-1
+      smoke-url:
+        description: URL that must answer 200 after the rollout (empty = skip)
+        type: string
+        default: ''
+      smoke-expect:
+        description: Text the smoke response must contain, e.g. the commit SHA (empty = status only)
+        type: string
+        default: ''
+
+jobs:
+  deploy:
+    name: deploy (${{ inputs.environment }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    environment:
+      name: ${{ inputs.environment }}
+      url: ${{ inputs.smoke-url }}
+    concurrency:
+      group: deploy-ecs-${{ inputs.cluster }}-${{ inputs.service }}
+      cancel-in-progress: false # never cut a rollout in half
+    permissions:
+      id-token: write
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Assume hub role (OIDC)
+        uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        with:
+          role-to-assume: ${{ inputs.gha-role-arn }}
+          role-session-name: gha-${{ github.run_id }}
+          aws-region: ${{ inputs.aws-region }}
+
+      - name: Chain into deploy role
+        uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        with:
+          role-to-assume: ${{ inputs.target-role-arn }}
+          role-chaining: true
+          role-session-name: gha-${{ github.run_id }}
+          aws-region: ${{ inputs.aws-region }}
+          allowed-account-ids: ${{ inputs.target-account-id }}
+
+      - name: Register task definition revision
+        id: taskdef
+        env:
+          FAMILY: ${{ inputs.task-family }}
+          CONTAINER: ${{ inputs.container-name }}
+          IMAGE: ${{ inputs.image-ref }}
+        run: |
+          aws ecs describe-task-definition --task-definition "$FAMILY" --query taskDefinition > current.json
+          # Swap the image, drop the read-only fields the register call rejects
+          jq --arg c "$CONTAINER" --arg img "$IMAGE" '
+            (.containerDefinitions[] | select(.name == $c) | .image) = $img
+            | del(.taskDefinitionArn, .revision, .status, .requiresAttributes, .compatibilities,
+                  .registeredAt, .registeredBy, .deregisteredAt)' current.json > next.json
+          jq -e --arg c "$CONTAINER" 'any(.containerDefinitions[]; .name == $c)' next.json > /dev/null \
+            || { echo "::error::container ${CONTAINER} not found in ${FAMILY}"; exit 1; }
+          arn=$(aws ecs register-task-definition --cli-input-json file://next.json \
+            --query taskDefinition.taskDefinitionArn --output text)
+          echo "arn=${arn}" >> "$GITHUB_OUTPUT"
+          echo "Task definition: \`${arn}\`, image \`${IMAGE}\`" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Update service and wait for the rollout
+        env:
+          CLUSTER: ${{ inputs.cluster }}
+          SERVICE: ${{ inputs.service }}
+          TASKDEF: ${{ steps.taskdef.outputs.arn }}
+        run: |
+          aws ecs update-service --cluster "$CLUSTER" --service "$SERVICE" --task-definition "$TASKDEF" \
+            --query service.serviceName --output text
+          # services-stable also succeeds after a circuit-breaker rollback, so check what is running
+          aws ecs wait services-stable --cluster "$CLUSTER" --services "$SERVICE"
+          read -r running state < <(aws ecs describe-services --cluster "$CLUSTER" --services "$SERVICE" \
+            --query "services[0].deployments[?status=='PRIMARY'] | [0].[taskDefinition, rolloutState]" --output text)
+          echo "PRIMARY: ${running} (${state})"
+          if [[ "$running" != "$TASKDEF" || "$state" != "COMPLETED" ]]; then
+            echo "::error::rollout of ${TASKDEF} did not complete (ECS circuit breaker rolled back to ${running})"
+            exit 1
+          fi
+
+      - name: Smoke test
+        if: inputs.smoke-url != ''
+        env:
+          URL: ${{ inputs.smoke-url }}
+          EXPECT: ${{ inputs.smoke-expect }}
+        run: |
+          # The old task may still answer for a few seconds after the rollout (deregistration delay)
+          for i in $(seq 1 12); do
+            body=$(curl -fsS --max-time 5 "$URL" || true)
+            if [[ -n "$body" && ( -z "$EXPECT" || "$body" == *"$EXPECT"* ) ]]; then
+              echo "smoke OK after ${i} attempt(s)"; exit 0
+            fi
+            sleep 5
+          done
+          echo "::error::${URL} did not return the expected response"
+          exit 1

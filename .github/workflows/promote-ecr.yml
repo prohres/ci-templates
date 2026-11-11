@@ -1,0 +1,66 @@
+name: promote-ecr
+
+# Reusable: after an environment approval, add a release tag (e.g. prod-<sha>) to an image digest that
+# already passed the earlier stages. Retag only (batch-get-image + put-image): no rebuild, no new layers.
+# The caller must grant: id-token: write.
+on:
+  workflow_call:
+    inputs:
+      environment:
+        description: GitHub environment with required reviewers (its OIDC sub selects the role)
+        type: string
+        default: prod
+      image-ref:
+        description: <registry>/<name>@sha256:... from container-build
+        type: string
+        required: true
+      tag:
+        description: Release tag to add, e.g. prod-<git sha>
+        type: string
+        required: true
+      gha-role-arn:
+        type: string
+        required: true
+      aws-region:
+        type: string
+        default: eu-central-1
+
+jobs:
+  promote:
+    name: promote (${{ inputs.environment }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    environment: ${{ inputs.environment }} # pauses here until a reviewer approves
+    permissions:
+      id-token: write
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Assume promote role (OIDC)
+        uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        with:
+          role-to-assume: ${{ inputs.gha-role-arn }}
+          role-session-name: gha-${{ github.run_id }}
+          aws-region: ${{ inputs.aws-region }}
+
+      - name: Tag the digest
+        env:
+          IMAGE: ${{ inputs.image-ref }}
+          TAG: ${{ inputs.tag }}
+        run: |
+          repo_path=${IMAGE%@*}; digest=${IMAGE#*@}; name=${repo_path#*/}
+          # Re-run safe: the tag may already point to this digest; immutability rejects any other digest
+          existing=$(aws ecr describe-images --repository-name "$name" --image-ids "imageTag=${TAG}" \
+            --query 'imageDetails[0].imageDigest' --output text 2>/dev/null || true)
+          if [[ "$existing" == "$digest" ]]; then
+            echo "::notice::${name}:${TAG} already points to ${digest}"
+          else
+            aws ecr batch-get-image --repository-name "$name" --image-ids "imageDigest=${digest}" \
+              --query 'images[0].[imageManifest, imageManifestMediaType]' --output json > image.json
+            aws ecr put-image --repository-name "$name" --image-tag "$TAG" \
+              --image-manifest "$(jq -r '.[0]' image.json)" \
+              --image-manifest-media-type "$(jq -r '.[1]' image.json)" \
+              --query image.imageId --output text
+          fi
+          echo "Promoted \`${name}@${digest}\` as \`${TAG}\`" >> "$GITHUB_STEP_SUMMARY"
