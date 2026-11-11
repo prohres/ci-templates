@@ -11,6 +11,9 @@ how CI works instead of a copy in every repo.
 | `.github/workflows/tf-plan.yml` | reusable workflow | `lint` job without cloud access (tflint + checkov, configured by the caller's `.tflint.hcl` / `.checkov.yaml`) → optional selection of changed stacks → matrix per stack: `fmt -check` → `validate` → `plan`; plan posted as one PR comment per stack, updated in place; `terraform-ok` aggregates the result |
 | `.github/workflows/tf-apply.yml` | reusable workflow | after merge: plan per stack (saved to a private S3 bucket) → approval in a GitHub environment, only for stacks with changes → apply exactly the saved plan → follow-up plan must be clean |
 | `.github/workflows/tf-drift.yml` | reusable workflow | scheduled plan per stack: drift opens or updates one issue per stack (resource addresses only), a clean plan closes it; no auto-apply |
+| `.github/workflows/container-build.yml` | reusable workflow | `lint` job without cloud access (hadolint + gitleaks) → build once → trivy scan → optional push to ECR as `<name>:<git sha>` (immutable); outputs the digest; a re-run of the same commit reuses the image |
+| `.github/workflows/deploy-ecs.yml` | reusable workflow | in a GitHub environment: OIDC hub role → role chaining into the deploy role → new task definition revision with only the image changed → wait for the rollout, fail on a circuit-breaker rollback → smoke test |
+| `.github/workflows/promote-ecr.yml` | reusable workflow | after an environment approval: add a release tag (e.g. `prod-<sha>`) to a digest that passed the earlier stages; retag only, no rebuild |
 
 Composite actions are building blocks (steps on the caller's runner); reusable workflows are whole
 pipelines (own jobs, matrix, permissions, environments).
@@ -97,6 +100,51 @@ jobs:
       target-account-id: "<target-account>"
 ```
 
+App pipeline: build once, then deploy and promote the same digest.
+
+```yaml
+jobs:
+  build:
+    permissions:
+      contents: read
+      id-token: write
+    uses: prohres/ci-templates/.github/workflows/container-build.yml@v1
+    with:
+      image-name: <ecr-repo>
+      push: ${{ github.event_name == 'push' }}     # pull requests: lint, build and scan only
+      gha-role-arn: arn:aws:iam::<hub-account>:role/gha-app-build
+
+  deploy-dev:
+    needs: build
+    if: github.event_name == 'push'
+    permissions:
+      id-token: write
+    uses: prohres/ci-templates/.github/workflows/deploy-ecs.yml@v1
+    with:
+      environment: dev
+      image-ref: ${{ needs.build.outputs.image-ref }}
+      gha-role-arn: arn:aws:iam::<hub-account>:role/gha-app-deploy-dev
+      target-role-arn: arn:aws:iam::<dev-account>:role/app-deploy
+      target-account-id: "<dev-account>"
+      cluster: <cluster>
+      service: <service>
+      task-family: <family>
+      container-name: <container>
+      smoke-url: http://<alb-dns>/version.json
+      smoke-expect: ${{ github.sha }}             # the new version answers, not the old task
+
+  promote-prod:
+    needs: [build, deploy-dev]
+    permissions:
+      id-token: write
+    uses: prohres/ci-templates/.github/workflows/promote-ecr.yml@v1
+    with:
+      environment: prod                           # required reviewers
+      image-ref: ${{ needs.build.outputs.image-ref }}
+      tag: prod-${{ github.sha }}
+      gha-role-arn: arn:aws:iam::<hub-account>:role/gha-app-promote
+```
+
 ## Versioning
 
 | Ref | Meaning |
@@ -115,6 +163,10 @@ remove it in `v2`.
 - Inputs reach shell steps through `env`, never inline `${{ }}` in `run` (script injection).
 - `actions/checkout` runs with `persist-credentials: false`.
 - Static checks run in a job without `id-token`; tool versions are pinned and at least two weeks old.
+- Release binaries (hadolint, gitleaks, trivy) are checked against a sha256 pinned in the workflow;
+  a version bump needs a new checksum.
+- `container-build` scans the image before the push, and gitleaks runs with `--redact`: a finding never
+  reaches the registry or the public log.
 - `tf-setup` puts an email mask in front of `terraform` on `PATH`: every later Terraform call in the job
   prints `[redacted-email]` instead of an address (a provider error can print a sensitive value in clear
   text). Exit codes are kept; stderr is merged into stdout.

@@ -1,0 +1,177 @@
+name: container-build
+
+# Reusable: lint (hadolint + gitleaks) without AWS, then build the image once and scan it (trivy).
+# With push: true the image goes to ECR as <name>:<git sha> (immutable tag) and the job outputs the digest;
+# later stages deploy and promote that digest, never a rebuild. Re-running the same commit reuses the
+# image already in ECR. The caller must grant: contents: read, id-token: write.
+on:
+  workflow_call:
+    inputs:
+      image-name:
+        description: ECR repository name
+        type: string
+        required: true
+      push:
+        description: Push to ECR (true on the default branch, false on pull requests)
+        type: boolean
+        default: false
+      gha-role-arn:
+        description: Role allowed to push to the repository (needed when push is true)
+        type: string
+        default: ''
+      aws-region:
+        type: string
+        default: eu-central-1
+      context:
+        type: string
+        default: .
+      dockerfile:
+        type: string
+        default: Dockerfile
+      severity:
+        description: Trivy severities that fail the build
+        type: string
+        default: HIGH,CRITICAL
+      hadolint-version:
+        type: string
+        default: v2.15.1
+      gitleaks-version:
+        type: string
+        default: 8.30.1
+      trivy-version:
+        type: string
+        default: 0.76.1
+    outputs:
+      image-ref:
+        description: <registry>/<name>@sha256:... (empty when push is false)
+        value: ${{ jobs.build.outputs.image-ref }}
+      digest:
+        value: ${{ jobs.build.outputs.digest }}
+
+env:
+  # Checksums of the pinned tool versions above; a new version needs a new checksum
+  HADOLINT_SHA256: c7187db94eeeeca956519a6af171adc31453941a1e777961f6e680f697c8c507
+  GITLEAKS_SHA256: 551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb
+  TRIVY_SHA256: c7cbe3137fb8a48a17574bede3dd6beb16742d1e9772929940fc90082c39d9c0
+
+jobs:
+  # No id-token here: linters never see AWS credentials
+  lint:
+    name: lint (hadolint + gitleaks)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install tools (pinned versions, verified checksums)
+        env:
+          HADOLINT_VERSION: ${{ inputs.hadolint-version }}
+          GITLEAKS_VERSION: ${{ inputs.gitleaks-version }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/bin"
+          cd "$RUNNER_TEMP"
+          curl -fsSLo bin/hadolint "https://github.com/hadolint/hadolint/releases/download/${HADOLINT_VERSION}/hadolint-linux-x86_64"
+          echo "${HADOLINT_SHA256}  bin/hadolint" | sha256sum -c -
+          curl -fsSLO "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
+          echo "${GITLEAKS_SHA256}  gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz" | sha256sum -c -
+          tar -xzf "gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz" -C bin gitleaks
+          chmod +x bin/hadolint
+          echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
+
+      - name: hadolint
+        env:
+          DOCKERFILE: ${{ inputs.context }}/${{ inputs.dockerfile }}
+        run: hadolint "$DOCKERFILE"
+
+      # Scans the files of this commit; secrets in older history are a one-off cleanup, not a PR gate.
+      # --redact keeps any finding out of the public log.
+      - name: gitleaks
+        run: gitleaks dir . --redact --no-banner --exit-code 1
+
+  build:
+    name: build${{ inputs.push && ' + push' || '' }}
+    needs: lint
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      id-token: write
+    defaults:
+      run:
+        shell: bash
+    outputs:
+      image-ref: ${{ steps.push.outputs.image-ref }}
+      digest: ${{ steps.push.outputs.digest }}
+    env:
+      LOCAL_IMAGE: local/${{ inputs.image-name }}:${{ github.sha }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: docker build
+        env:
+          CONTEXT: ${{ inputs.context }}
+          DOCKERFILE: ${{ inputs.context }}/${{ inputs.dockerfile }}
+          SOURCE: ${{ github.server_url }}/${{ github.repository }}
+        run: |
+          docker build --pull -f "$DOCKERFILE" -t "$LOCAL_IMAGE" \
+            --label "org.opencontainers.image.source=${SOURCE}" \
+            --label "org.opencontainers.image.revision=${GITHUB_SHA}" \
+            --build-arg "VERSION=${GITHUB_SHA}" \
+            "$CONTEXT"
+
+      - name: Install trivy (pinned version, verified checksum)
+        env:
+          TRIVY_VERSION: ${{ inputs.trivy-version }}
+        run: |
+          cd "$RUNNER_TEMP"
+          curl -fsSLO "https://github.com/aquasecurity/trivy/releases/download/v${TRIVY_VERSION}/trivy_${TRIVY_VERSION}_Linux-64bit.tar.gz"
+          echo "${TRIVY_SHA256}  trivy_${TRIVY_VERSION}_Linux-64bit.tar.gz" | sha256sum -c -
+          mkdir -p bin && tar -xzf "trivy_${TRIVY_VERSION}_Linux-64bit.tar.gz" -C bin trivy
+          echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
+
+      # Scan before the push: a vulnerable image never reaches the registry
+      - name: trivy image scan
+        env:
+          SEVERITY: ${{ inputs.severity }}
+        run: trivy image --exit-code 1 --severity "$SEVERITY" --ignore-unfixed --no-progress "$LOCAL_IMAGE"
+
+      - name: Assume push role (OIDC)
+        if: inputs.push
+        uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        with:
+          role-to-assume: ${{ inputs.gha-role-arn }}
+          role-session-name: gha-${{ github.run_id }}
+          aws-region: ${{ inputs.aws-region }}
+
+      - name: Push to ECR (once per commit)
+        id: push
+        if: inputs.push
+        env:
+          NAME: ${{ inputs.image-name }}
+          REGION: ${{ inputs.aws-region }}
+        run: |
+          account=$(aws sts get-caller-identity --query Account --output text)
+          registry="${account}.dkr.ecr.${REGION}.amazonaws.com"
+          # Tags are immutable: a re-run of the same commit reuses the image instead of failing
+          digest=$(aws ecr describe-images --repository-name "$NAME" --image-ids "imageTag=${GITHUB_SHA}" \
+            --query 'imageDetails[0].imageDigest' --output text 2>/dev/null || true)
+          if [[ "$digest" == sha256:* ]]; then
+            echo "::notice::${NAME}:${GITHUB_SHA} already in ECR, reusing ${digest}"
+          else
+            aws ecr get-login-password --region "$REGION" | docker login --username AWS --password-stdin "$registry"
+            docker tag "$LOCAL_IMAGE" "${registry}/${NAME}:${GITHUB_SHA}"
+            docker push "${registry}/${NAME}:${GITHUB_SHA}"
+            digest=$(docker inspect --format '{{index .RepoDigests 0}}' "${registry}/${NAME}:${GITHUB_SHA}" | cut -d@ -f2)
+          fi
+          echo "digest=${digest}" >> "$GITHUB_OUTPUT"
+          echo "image-ref=${registry}/${NAME}@${digest}" >> "$GITHUB_OUTPUT"
+          echo "Image: \`${registry}/${NAME}@${digest}\` (tag ${GITHUB_SHA})" >> "$GITHUB_STEP_SUMMARY"
