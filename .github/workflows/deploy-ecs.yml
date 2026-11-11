@@ -42,7 +42,13 @@ on:
         type: string
         default: eu-central-1
       smoke-url:
-        description: URL that must answer 200 after the rollout (empty = skip)
+        description: URL that must answer 200 after the rollout (empty = smoke-path or skip)
+        type: string
+        default: ''
+      smoke-path:
+        description: >-
+          Path on the service's own load balancer, e.g. /version.json, used when smoke-url is empty: the
+          URL is looked up after the rollout, so a re-created load balancer needs no config change
         type: string
         default: ''
       smoke-expect:
@@ -57,7 +63,7 @@ jobs:
     timeout-minutes: 20
     environment:
       name: ${{ inputs.environment }}
-      url: ${{ inputs.smoke-url }}
+      url: ${{ steps.url.outputs.url }}
     concurrency:
       group: deploy-ecs-${{ inputs.cluster }}-${{ inputs.service }}
       cancel-in-progress: false # never cut a rollout in half
@@ -133,10 +139,32 @@ jobs:
             sleep 15
           done
 
-      - name: Smoke test
-        if: inputs.smoke-url != ''
+      - name: Find the smoke URL
+        id: url
+        if: inputs.smoke-url != '' || inputs.smoke-path != ''
         env:
           URL: ${{ inputs.smoke-url }}
+          SMOKE_PATH: ${{ inputs.smoke-path }}
+          CLUSTER: ${{ inputs.cluster }}
+          SERVICE: ${{ inputs.service }}
+        run: |
+          if [[ -z "$URL" ]]; then
+            # The service's own load balancer: its DNS name changes whenever the stack is re-created
+            tg=$(aws ecs describe-services --cluster "$CLUSTER" --services "$SERVICE" \
+              --query 'services[0].loadBalancers[0].targetGroupArn' --output text)
+            [[ "$tg" == arn:* ]] || { echo "::error::${SERVICE} has no load balancer; set smoke-url"; exit 1; }
+            lb=$(aws elbv2 describe-target-groups --target-group-arns "$tg" \
+              --query 'TargetGroups[0].LoadBalancerArns[0]' --output text)
+            dns=$(aws elbv2 describe-load-balancers --load-balancer-arns "$lb" \
+              --query 'LoadBalancers[0].DNSName' --output text)
+            URL="http://${dns}${SMOKE_PATH}" # HTTP only until the load balancer gets a certificate
+          fi
+          echo "url=${URL}" >> "$GITHUB_OUTPUT"
+
+      - name: Smoke test
+        if: steps.url.outputs.url != ''
+        env:
+          URL: ${{ steps.url.outputs.url }}
           EXPECT: ${{ inputs.smoke-expect }}
         run: |
           # The old task may still answer for a few seconds after the rollout (deregistration delay)
