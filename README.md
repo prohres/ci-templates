@@ -12,7 +12,7 @@ how CI works instead of a copy in every repo.
 | `.github/workflows/tf-apply.yml` | reusable workflow | after merge: plan per stack (saved to a private S3 bucket) → approval in a GitHub environment, only for stacks with changes → apply exactly the saved plan → follow-up plan must be clean; `destroy: true` plans and applies a full teardown through the same gate |
 | `.github/workflows/tf-drift.yml` | reusable workflow | scheduled plan per stack: drift opens or updates one issue per stack (resource addresses only), a clean plan closes it; no auto-apply |
 | `.github/workflows/container-build.yml` | reusable workflow | `lint` job without cloud access (hadolint + gitleaks) → build once → trivy scan → optional push to ECR as `<name>:<git sha>` (immutable); outputs the digest; a re-run of the same commit reuses the image |
-| `.github/workflows/deploy-ecs.yml` | reusable workflow | in a GitHub environment: OIDC hub role → role chaining into the deploy role → new task definition revision with only the image changed → wait for the rollout, fail on a circuit-breaker rollback → smoke test |
+| `.github/workflows/deploy-ecs.yml` | reusable workflow | in a GitHub environment: OIDC hub role → role chaining into the deploy role → new task definition revision with only the image changed → wait for the rollout, fail on a circuit-breaker rollback → smoke test (`smoke-url`, or `smoke-path` on the service's own load balancer) |
 | `.github/workflows/promote-ecr.yml` | reusable workflow | after an environment approval: add a release tag (e.g. `prod-<sha>`) to a digest that passed the earlier stages; retag only, no rebuild |
 
 Composite actions are building blocks (steps on the caller's runner); reusable workflows are whole
@@ -100,7 +100,7 @@ jobs:
       target-account-id: "<target-account>"
 ```
 
-App pipeline: build once, then deploy and promote the same digest.
+App pipeline: build once, then deploy that digest (`promote-ecr` can add a release tag to it after an approval).
 
 ```yaml
 jobs:
@@ -130,19 +130,8 @@ jobs:
       service: <service>
       task-family: <family>
       container-name: <container>
-      smoke-url: http://<alb-dns>/version.json
+      smoke-path: /version.json                   # URL looked up from the service's load balancer
       smoke-expect: ${{ github.sha }}             # the new version answers, not the old task
-
-  promote-prod:
-    needs: [build, deploy-dev]
-    permissions:
-      id-token: write
-    uses: prohres/ci-templates/.github/workflows/promote-ecr.yml@v1
-    with:
-      environment: prod                           # required reviewers
-      image-ref: ${{ needs.build.outputs.image-ref }}
-      tag: prod-${{ github.sha }}
-      gha-role-arn: arn:aws:iam::<hub-account>:role/gha-app-promote
 ```
 
 ## Versioning
