@@ -111,15 +111,27 @@ jobs:
         run: |
           aws ecs update-service --cluster "$CLUSTER" --service "$SERVICE" --task-definition "$TASKDEF" \
             --query service.serviceName --output text
-          # services-stable also succeeds after a circuit-breaker rollback, so check what is running
-          aws ecs wait services-stable --cluster "$CLUSTER" --services "$SERVICE"
-          read -r running state < <(aws ecs describe-services --cluster "$CLUSTER" --services "$SERVICE" \
-            --query "services[0].deployments[?status=='PRIMARY'] | [0].[taskDefinition, rolloutState]" --output text)
-          echo "PRIMARY: ${running} (${state})"
-          if [[ "$running" != "$TASKDEF" || "$state" != "COMPLETED" ]]; then
-            echo "::error::rollout of ${TASKDEF} did not complete (ECS circuit breaker rolled back to ${running})"
-            exit 1
-          fi
+          # Wait for ECS's own verdict on this rollout. services-stable is not enough: it returns while the
+          # rollout is still IN_PROGRESS, and also after a circuit-breaker rollback to the old revision.
+          deadline=$((SECONDS + 900))
+          while :; do
+            read -r running state < <(aws ecs describe-services --cluster "$CLUSTER" --services "$SERVICE" \
+              --query "services[0].deployments[?status=='PRIMARY'] | [0].[taskDefinition, rolloutState]" --output text)
+            echo "PRIMARY: ${running} (${state})"
+            if [[ "$running" != "$TASKDEF" ]]; then
+              echo "::error::ECS circuit breaker rolled back to ${running}; ${TASKDEF} never got healthy"
+              exit 1
+            fi
+            case "$state" in
+              COMPLETED) break ;;
+              FAILED) echo "::error::rollout of ${TASKDEF} failed"; exit 1 ;;
+            esac
+            if (( SECONDS > deadline )); then
+              echo "::error::rollout of ${TASKDEF} still ${state} after 15 min"
+              exit 1
+            fi
+            sleep 15
+          done
 
       - name: Smoke test
         if: inputs.smoke-url != ''
