@@ -19,6 +19,12 @@ on:
         description: Role allowed to push to the repository (needed when push is true)
         type: string
         default: ''
+      registry-account-id:
+        description: >-
+          Account that owns the repository (empty = the push role's own account). A cross-account push
+          also needs a repository policy in that account that allows the push role.
+        type: string
+        default: ''
       aws-region:
         type: string
         default: eu-central-1
@@ -158,11 +164,17 @@ jobs:
         env:
           NAME: ${{ inputs.image-name }}
           REGION: ${{ inputs.aws-region }}
+          REGISTRY_ACCOUNT_ID: ${{ inputs.registry-account-id }}
         run: |
-          account=$(aws sts get-caller-identity --query Account --output text)
+          account=${REGISTRY_ACCOUNT_ID:-$(aws sts get-caller-identity --query Account --output text)}
           registry="${account}.dkr.ecr.${REGION}.amazonaws.com"
+          # The repository may not exist (infrastructure destroyed between sessions): say so, not "name unknown"
+          if ! aws ecr describe-repositories --registry-id "$account" --repository-names "$NAME" > /dev/null 2>&1; then
+            echo "::error::repository ${NAME} not found in the registry, or no access: is the infrastructure up?"
+            exit 1
+          fi
           # Tags are immutable: a re-run of the same commit reuses the image instead of failing
-          digest=$(aws ecr describe-images --repository-name "$NAME" --image-ids "imageTag=${GITHUB_SHA}" \
+          digest=$(aws ecr describe-images --registry-id "$account" --repository-name "$NAME" --image-ids "imageTag=${GITHUB_SHA}" \
             --query 'imageDetails[0].imageDigest' --output text 2>/dev/null || true)
           if [[ "$digest" == sha256:* ]]; then
             echo "::notice::${NAME}:${GITHUB_SHA} already in ECR, reusing ${digest}"
