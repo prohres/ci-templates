@@ -11,7 +11,7 @@ how CI works instead of a copy in every repo.
 | `.github/workflows/tf-plan.yml` | reusable workflow | `lint` job without cloud access (tflint + checkov, configured by the caller's `.tflint.hcl` / `.checkov.yaml`) → optional selection of changed stacks → matrix per stack: `fmt -check` → `validate` → `plan`; plan posted as one PR comment per stack, updated in place; `terraform-ok` aggregates the result |
 | `.github/workflows/tf-apply.yml` | reusable workflow | after merge: plan per stack (saved to a private S3 bucket) → approval in a GitHub environment, only for stacks with changes → apply exactly the saved plan → follow-up plan must be clean; `destroy: true` plans and applies a full teardown through the same gate |
 | `.github/workflows/tf-drift.yml` | reusable workflow | scheduled plan per stack: drift opens or updates one issue per stack (resource addresses only), a clean plan closes it; no auto-apply |
-| `.github/workflows/container-build.yml` | reusable workflow | `lint` job without cloud access (hadolint + gitleaks) → build once → trivy scan → optional push to ECR as `<name>:<git sha>` (immutable); outputs the digest; a re-run of the same commit reuses the image |
+| `.github/workflows/container-build.yml` | reusable workflow | `lint` job without cloud access (hadolint + gitleaks) → build once → trivy scan → optional push to ECR as `<name>:<git sha>` (immutable; own account or `registry-account-id`); outputs the digest; a re-run of the same commit reuses the image |
 | `.github/workflows/deploy-ecs.yml` | reusable workflow | in a GitHub environment: OIDC hub role → role chaining into the deploy role → new task definition revision with only the image changed → wait for the rollout, fail on a circuit-breaker rollback → smoke test (`smoke-url`, or `smoke-path` on the service's own load balancer) |
 | `.github/workflows/promote-ecr.yml` | reusable workflow | after an environment approval: add a release tag (e.g. `prod-<sha>`) to a digest that passed the earlier stages; retag only, no rebuild |
 
@@ -113,6 +113,7 @@ jobs:
       image-name: <ecr-repo>
       push: ${{ github.event_name == 'push' }}     # pull requests: lint, build and scan only
       gha-role-arn: arn:aws:iam::<hub-account>:role/gha-app-build
+      registry-account-id: "<dev-account>"         # optional: repository in another account (repository policy required)
 
   deploy-dev:
     needs: build
