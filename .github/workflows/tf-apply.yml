@@ -50,6 +50,14 @@ on:
         description: State bucket on top of backend-config (empty = from backend-config)
         type: string
         default: ''
+      tf-vars:
+        description: JSON object of extra Terraform variables (see tf-setup)
+        type: string
+        default: '{}'
+      destroy:
+        description: Plan and apply a full destroy of every stack (same approval gate)
+        type: boolean
+        default: false
 
 jobs:
   plan:
@@ -81,12 +89,14 @@ jobs:
           aws-region: ${{ inputs.aws-region }}
           backend-config: ${{ inputs.backend-config }}
           backend-bucket: ${{ inputs.backend-bucket }}
+          tf-vars: ${{ inputs.tf-vars }}
 
       - name: terraform plan
         id: plan
         run: |
+          mode=(); if [[ "$DESTROY" == true ]]; then mode=(-destroy); fi
           set +e
-          terraform plan -input=false -no-color -lock-timeout=5m -detailed-exitcode -out=tfplan | tee plan.txt
+          terraform plan -input=false -no-color -lock-timeout=5m -detailed-exitcode "${mode[@]}" -out=tfplan | tee plan.txt
           rc=${PIPESTATUS[0]}
           set -e
           # -detailed-exitcode: 0 = no changes, 2 = changes, 1 = error
@@ -105,6 +115,7 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY" # what the reviewer reads before approving
         env:
           STACK: ${{ matrix.stack }}
+          DESTROY: ${{ inputs.destroy }}
 
       - name: Save plan to S3
         if: steps.plan.outputs.changes == 'true'
@@ -179,6 +190,7 @@ jobs:
           aws-region: ${{ inputs.aws-region }}
           backend-config: ${{ inputs.backend-config }}
           backend-bucket: ${{ inputs.backend-bucket }}
+          tf-vars: ${{ inputs.tf-vars }}
 
       - name: Fetch the approved plan
         env:
@@ -189,5 +201,10 @@ jobs:
       - name: terraform apply
         run: terraform apply -input=false -no-color tfplan
 
+      # After a destroy the clean result is "nothing left to destroy"
       - name: Follow-up plan must show no changes
-        run: terraform plan -input=false -no-color -lock-timeout=5m -detailed-exitcode
+        run: |
+          mode=(); if [[ "$DESTROY" == true ]]; then mode=(-destroy); fi
+          terraform plan -input=false -no-color -lock-timeout=5m -detailed-exitcode "${mode[@]}"
+        env:
+          DESTROY: ${{ inputs.destroy }}

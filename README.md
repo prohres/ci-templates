@@ -7,9 +7,9 @@ how CI works instead of a copy in every repo.
 
 | Path | Kind | What it does |
 |---|---|---|
-| `actions/tf-setup` | composite action | Terraform from `.terraform-version` (no wrapper) → email mask on `PATH` → OIDC hub role → role chaining into the target role → `terraform init` with a shared `backend.hcl` (+ optional `backend-bucket`); exports `TF_VAR_account_id` |
+| `actions/tf-setup` | composite action | Terraform from `.terraform-version` (no wrapper) → email mask on `PATH` → OIDC hub role → role chaining into the target role → `terraform init` with a shared `backend.hcl` (+ optional `backend-bucket`); exports `TF_VAR_account_id` and any `tf-vars` |
 | `.github/workflows/tf-plan.yml` | reusable workflow | `lint` job without cloud access (tflint + checkov, configured by the caller's `.tflint.hcl` / `.checkov.yaml`) → optional selection of changed stacks → matrix per stack: `fmt -check` → `validate` → `plan`; plan posted as one PR comment per stack, updated in place; `terraform-ok` aggregates the result |
-| `.github/workflows/tf-apply.yml` | reusable workflow | after merge: plan per stack (saved to a private S3 bucket) → approval in a GitHub environment, only for stacks with changes → apply exactly the saved plan → follow-up plan must be clean |
+| `.github/workflows/tf-apply.yml` | reusable workflow | after merge: plan per stack (saved to a private S3 bucket) → approval in a GitHub environment, only for stacks with changes → apply exactly the saved plan → follow-up plan must be clean; `destroy: true` plans and applies a full teardown through the same gate |
 | `.github/workflows/tf-drift.yml` | reusable workflow | scheduled plan per stack: drift opens or updates one issue per stack (resource addresses only), a clean plan closes it; no auto-apply |
 | `.github/workflows/container-build.yml` | reusable workflow | `lint` job without cloud access (hadolint + gitleaks) → build once → trivy scan → optional push to ECR as `<name>:<git sha>` (immutable); outputs the digest; a re-run of the same commit reuses the image |
 | `.github/workflows/deploy-ecs.yml` | reusable workflow | in a GitHub environment: OIDC hub role → role chaining into the deploy role → new task definition revision with only the image changed → wait for the rollout, fail on a circuit-breaker rollback → smoke test |
@@ -173,4 +173,5 @@ remove it in `v2`.
 - `tf-setup` fails if any `TF_LOG*` variable is set (except `TF_LOG_PATH`): debug logs print provider
   API responses, and job logs of a public repo are public.
 - Account ids and bucket names can come from caller repo variables (`target-account-id` → `TF_VAR_account_id`,
-  `backend-bucket`): nothing account-specific has to be committed to a public repo.
+  `tf-vars`, `backend-bucket`): nothing account-specific has to be committed to a public repo. `tf-vars`
+  names and values are validated (valid names, single-line strings) before they reach `GITHUB_ENV`.
