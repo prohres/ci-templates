@@ -29,6 +29,10 @@ on:
         description: State bucket on top of backend-config (empty = from backend-config)
         type: string
         default: ''
+      tf-vars:
+        description: JSON object of extra Terraform variables (see tf-setup)
+        type: string
+        default: '{}'
       issue-label:
         type: string
         default: drift
@@ -64,6 +68,7 @@ jobs:
           aws-region: ${{ inputs.aws-region }}
           backend-config: ${{ inputs.backend-config }}
           backend-bucket: ${{ inputs.backend-bucket }}
+          tf-vars: ${{ inputs.tf-vars }}
 
       # A full plan, not -refresh-only: catches manual changes and merged-but-unapplied code.
       # The state lock (with a timeout) makes a check during an apply wait instead of reporting half-applied state.

@@ -30,6 +30,10 @@ on:
         description: State bucket on top of backend-config (empty = from backend-config)
         type: string
         default: ''
+      tf-vars:
+        description: JSON object of extra Terraform variables (see tf-setup)
+        type: string
+        default: '{}'
       tflint-version:
         type: string
         default: v0.65.0
@@ -172,6 +176,7 @@ jobs:
           aws-region: ${{ inputs.aws-region }}
           backend-config: ${{ inputs.backend-config }}
           backend-bucket: ${{ inputs.backend-bucket }}
+          tf-vars: ${{ inputs.tf-vars }}
 
       - name: terraform fmt
         run: terraform fmt -check -recursive

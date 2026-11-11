@@ -27,6 +27,11 @@ inputs:
       State bucket, passed to init on top of backend-config; lets a public repo keep the bucket
       name (often derived from an account id) out of git. Empty: the bucket comes from backend-config.
     default: ''
+  tf-vars:
+    description: >-
+      JSON object of extra Terraform variables, exported as TF_VAR_<name> (e.g. account ids from caller
+      repo variables). Single-line string values only.
+    default: '{}'
   version-file:
     description: File with the Terraform version, relative to the repo root
     default: .terraform-version
@@ -90,6 +95,17 @@ runs:
       env:
         ACCOUNT_ID: ${{ inputs.target-account-id }}
       run: echo "TF_VAR_account_id=$ACCOUNT_ID" >> "$GITHUB_ENV"
+
+    # Names and values are checked before they reach GITHUB_ENV: a newline would inject another variable
+    - name: Export extra Terraform variables
+      shell: bash
+      env:
+        TF_VARS: ${{ inputs.tf-vars }}
+      run: |
+        jq -e 'type == "object" and all(to_entries[]; (.key | test("^[A-Za-z_][A-Za-z0-9_]*$"))
+          and (.value | type == "string" and (test("[\r\n]") | not)))' <<< "$TF_VARS" > /dev/null \
+          || { echo "::error::tf-vars must be a JSON object of single-line strings with valid names"; exit 1; }
+        jq -r 'to_entries[] | "TF_VAR_\(.key)=\(.value)"' <<< "$TF_VARS" >> "$GITHUB_ENV"
 
     - name: terraform init
       shell: bash
