@@ -26,6 +26,10 @@ on:
       backend-config:
         type: string
         default: backend.hcl
+      backend-bucket:
+        description: State bucket on top of backend-config (empty = from backend-config)
+        type: string
+        default: ''
       tflint-version:
         type: string
         default: v0.65.0
@@ -167,6 +171,7 @@ jobs:
           target-account-id: ${{ inputs.target-account-id }}
           aws-region: ${{ inputs.aws-region }}
           backend-config: ${{ inputs.backend-config }}
+          backend-bucket: ${{ inputs.backend-bucket }}
 
       - name: terraform fmt
         run: terraform fmt -check -recursive

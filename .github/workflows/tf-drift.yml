@@ -25,6 +25,10 @@ on:
       backend-config:
         type: string
         default: backend.hcl
+      backend-bucket:
+        description: State bucket on top of backend-config (empty = from backend-config)
+        type: string
+        default: ''
       issue-label:
         type: string
         default: drift
@@ -59,6 +63,7 @@ jobs:
           target-account-id: ${{ inputs.target-account-id }}
           aws-region: ${{ inputs.aws-region }}
           backend-config: ${{ inputs.backend-config }}
+          backend-bucket: ${{ inputs.backend-bucket }}
 
       # A full plan, not -refresh-only: catches manual changes and merged-but-unapplied code.
       # The state lock (with a timeout) makes a check during an apply wait instead of reporting half-applied state.
